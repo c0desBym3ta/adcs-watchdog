@@ -14,7 +14,7 @@ Requires: pip install ldap3
 
 import argparse, sys, struct, json, html, os, hashlib, datetime, io, zipfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from ldap3 import Server, Connection, ALL, NTLM, SIMPLE, SUBTREE
+from ldap3 import Server, Connection, ALL, NTLM, SIMPLE, SUBTREE, SASL, KERBEROS
 from ldap3.core.exceptions import LDAPBindError
 from ldap3.protocol.microsoft import security_descriptor_control
 
@@ -49,6 +49,77 @@ def _guid(data, off):
 ENROLL_RIGHT_GUIDS = {
     "0e10c968-78fb-11d2-90d4-00c04f79dc55",  # Certificate-Enrollment  (Enroll)
     "a05b8cc2-17bc-4802-a710-e7c15ab866a2",  # Certificate-AutoEnrollment
+}
+
+# Extended rights GUIDs for CA management (used in DS_CTL_ACCESS Object ACEs on CA object)
+# Principal with these rights on the CA = ESC7
+# ── CA OBJECT SECURITY DESCRIPTOR — CUSTOM ACCESS MASKS ───────────────────
+# The CA object (pKIEnrollmentService) uses custom access mask bits
+# that are DIFFERENT from standard DS object rights.
+# Source: certutil /? and Certipy source code
+# CA ACL DECODING — confirmed from raw SD analysis
+# ManageCA / ManageCertificates come ONLY from Object ACEs (type 0x05) with GUIDs:
+#   GUID a05b8cc2 + DS_CTL_ACCESS (0x100) = ManageCA
+#   GUID 0e10c968 + DS_CTL_ACCESS (0x100) = Enroll  (certipy calls this Enroll on CA)
+#
+# Standard ACEs (type 0x00) on the CA use plain Windows DS object rights.
+# 0x00020094 = ReadControl(0x20000) + ReadProperty(0x10) + ListObject(0x80) + ListContents(0x4)
+# = READ ONLY — NOT ManageCertificates
+
+# Full control on CA = high standard rights + most DS bits
+# 0x000f00ff = standard full control
+# 0x000f01ff / 0x000f01bd = full control + DS_CTL_ACCESS (inherited)
+_CA_FULL_CORE = 0x000f0000 | 0x00000094  # core read+write bits always in full ctrl
+
+def ca_std_mask_to_labels(mask):
+    """Decode standard ACE (type 0x00) on CA — plain Windows DS object rights."""
+    if mask & 0x10000000: return ["GenericAll"]
+    # Full control: has WriteDACL + WriteOwner + high bits set
+    if (mask & 0x00040000) and (mask & 0x00080000) and (mask & 0x000f0000):
+        return ["FullControl"]
+    r = []
+    if mask & 0x00040000: r.append("WriteDACL")
+    if mask & 0x00080000: r.append("WriteOwner")
+    if mask & 0x00020000: r.append("ReadControl")
+    if mask & 0x00000080: r.append("ListObject")
+    if mask & 0x00000010: r.append("ReadProperty")
+    if mask & 0x00000004: r.append("ListContents")
+    if mask & 0x00000002: r.append("DeleteChild")
+    if mask & 0x00000001: r.append("CreateChild")
+    # 0x100 in a standard ACE on CA = part of full control, not a separate right
+    # Only label it if it's NOT combined with full control bits
+    if (mask & 0x00000100) and not r and not (mask & 0x000f0000):
+        r.append("ExtendedRight")
+    return r or [f"0x{mask:08x}"]
+
+def ca_is_dangerous(labels, tier):
+    """True if labels include dangerous CA management rights for a non-admin."""
+    if tier in ("high","system"): return False
+    return bool({"ManageCA","ManageCertificates","GenericAll",
+                 "FullControl","WriteDACL","WriteOwner"} & set(labels))
+
+# ── IMPORTANT: These GUIDs are CONTEXT-DEPENDENT ──────────────────────────
+# The same GUID means different things on a template vs a CA object:
+#
+#  GUID 0e10c968-...  on pKICertificateTemplate  = Certificate-Enrollment (Enroll)
+#  GUID 0e10c968-...  on pKIEnrollmentService    = Manage Certificates (Issue/Deny)
+#
+#  GUID a05b8cc2-...  on pKICertificateTemplate  = AutoEnrollment
+#  GUID a05b8cc2-...  on pKIEnrollmentService    = Manage CA (full management)
+#
+# parse_sd() accepts a context= parameter to resolve correctly.
+
+MANAGE_CA_GUID   = "a05b8cc2-17bc-4802-a710-e7c15ab866a2"
+MANAGE_CERT_GUID = "0e10c968-78fb-11d2-90d4-00c04f79dc55"
+
+# What each GUID means per context
+GUID_LABELS_TEMPLATE = {
+    MANAGE_CERT_GUID: ("Enroll",      False),   # (label, is_dangerous_for_esc7)
+    MANAGE_CA_GUID:   ("AutoEnroll",  False),
+}
+GUID_LABELS_CA = {
+    MANAGE_CERT_GUID: ("ManageCertificates", True),   # dangerous for ESC7
+    MANAGE_CA_GUID:   ("ManageCA",           True),   # dangerous for ESC7
 }
 
 # These GUIDs are actual msPKI template attributes.
@@ -159,6 +230,15 @@ def parse_sd(sb):
             a["dangerous_write"]=True; a["write_reason"]=reason
             continue
 
+        if m&DS_CTL_ACCESS:
+            # For CA objects: these GUIDs = ManageCA / ManageCertificates (ESC7)
+            # For template objects: these GUIDs = Enroll / AutoEnroll (NOT ESC4)
+            # dangerous_write is set context-aware in the CA collector
+            # Here we default to NOT dangerous (template context assumed)
+            a["dangerous_write"] = False
+            a["write_reason"] = ""
+            continue
+
         if m&DS_WRITE_PROP:
             if not a["scoped"] or guid is None:
                 # Unscoped WriteProperty (standard ACE, no GUID) = all attributes
@@ -198,8 +278,12 @@ def has_dangerous_write(ace):
     """True if this ACE grants write access that is exploitable for ESC4."""
     return ace.get("dangerous_write", False) and not ace["deny"]
 
-def rights_labels(ace):
-    """Human-readable rights for an ACE, using write_reason for accuracy."""
+def rights_labels(ace, context="template"):
+    """
+    Human-readable rights for an ACE.
+    context="template" : GUID 0e10c968 = Enroll,  a05b8cc2 = AutoEnroll
+    context="ca"       : GUID 0e10c968 = ManageCertificates, a05b8cc2 = ManageCA
+    """
     m=ace["mask"]
     r=[]
     if ace.get("dangerous_write") and not ace["deny"]:
@@ -207,13 +291,16 @@ def rights_labels(ace):
         if wr: r.append(wr)
     if m&DS_CTL_ACCESS:
         guid=ace.get("object_guid")
-        if guid in ENROLL_RIGHT_GUIDS:
-            lbl="AutoEnroll" if "Auto" in GUID_NAMES.get(guid,"") else "Enroll"
+        guid_map = GUID_LABELS_CA if context == "ca" else GUID_LABELS_TEMPLATE
+        if guid and guid in guid_map:
+            lbl, _ = guid_map[guid]
+            r.append(lbl)
         elif guid:
-            lbl=f"ExtRight[{GUID_NAMES.get(guid,guid[:8]+'…')}]"
+            lbl = "ExtRight[" + GUID_NAMES.get(guid, guid[:8]+"...") + "]"
+            r.append(lbl)
         else:
-            lbl="Enroll"
-        r.append(lbl)
+            # No GUID = generic control access
+            r.append("ManageCA" if context == "ca" else "Enroll")
     if m&AUTOENROLL: r.append("AutoEnroll")
     if m&READ_CTRL:  r.append("ReadControl")
     if m&DS_READ_PROP: r.append("ReadProperty")
@@ -373,6 +460,11 @@ def run_checks(t, acl, ca_info=None, container_acl=None):
     # CA-level flags (ESC6/7/8) — detected once and passed in
     c_esc6 = ca_info[0].get("esc6_flag",False) if ca_info else False
     c_esc7 = any(ca.get("esc7_vuln",False) for ca in (ca_info or []))
+    # Collect all ESC7 principals across all CAs
+    esc7_principals = []
+    for ca in (ca_info or []):
+        for p in ca.get("esc7_principals",[]):
+            esc7_principals.append((p[0], p[1], p[2]))
     c_esc8 = any(ca.get("esc8_accessible",False) for ca in (ca_info or []))
 
     c_san   =bool(nf&CT_SAN)
@@ -432,11 +524,16 @@ def run_checks(t, acl, ca_info=None, container_acl=None):
             ("CA has EDITF_ATTRIBUTESUBJECTALTNAME2 flag",c_esc6)],[],
             "CA accepts SAN from CSR on ANY template — effectively ESC1 on all templates"),
         chk("ESC7","high",[
-            ("Low-priv has ManageCA or ManageCertificates on CA",c_esc7)],[],
+            ("Low-priv has ManageCA or ManageCertificates on CA",c_esc7)],
+            esc7_principals,
             "Issue certificates for any template or approve pending requests"),
         chk("ESC8","high",[
             ("Web enrollment accessible over HTTP (NTLM relay possible)",c_esc8)],[],
             "Relay any NTLM auth to CA web enrollment → get cert as any machine/user"),
+        chk("ESC11","high",[
+            ("Encryption not enforced for ICPR requests",
+             any(ca.get("esc11_vuln",False) for ca in (ca_info or [])))],[],
+            "Plaintext ICPR requests accepted — relay attack without NTLM"),
         chk("ESC9","high",[
             ("NO_SECURITY_EXTENSION flag set",c_nosec),
             ("Auth EKU present",c_auth),
@@ -632,6 +729,173 @@ def build_bloodyad_output(tname, dn, raw_aces, conn, base):
 
 
 # ══════════════════════════════════════════════════════════
+# CERTIPY CA INTEGRATION
+# Runs certipy find -vulnerable -stdout and parses the output
+# for CA-level findings: ManageCA, ManageCertificates, ESC6/7/8/11
+# Certipy reads the CA registry via DCOM/RPC — unavailable via LDAP
+# ══════════════════════════════════════════════════════════
+
+def run_certipy(user, password, dc_ip, domain):
+    """
+    Run certipy find -vulnerable -stdout and parse CA permissions.
+    Returns dict keyed by CA name with certipy findings.
+    Returns None if certipy is not installed or fails.
+    """
+    import subprocess, shutil
+
+    certipy_bin = shutil.which("certipy") or shutil.which("certipy-ad")
+    if not certipy_bin:
+        # try common pipx/pip locations
+        for path in ["/usr/local/bin/certipy", "/root/.local/bin/certipy",
+                     "/opt/certipy/bin/certipy"]:
+            if os.path.exists(path):
+                certipy_bin = path
+                break
+    if not certipy_bin:
+        print("[!] certipy not found — CA RPC checks skipped")
+        print("    Install: pip install certipy-ad --break-system-packages")
+        return None
+
+    username = user.split("@")[0] if "@" in user else user
+    cmd = [
+        certipy_bin, "find",
+        "-u", f"{username}@{domain}",
+        "-p", password,
+        "-dc-ip", dc_ip,
+        "-vulnerable", "-stdout",
+    ]
+
+    print(f"[*] Running certipy for CA-level checks (RPC/DCOM) ...")
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60
+        )
+        output = result.stdout + result.stderr
+        if not output.strip():
+            print("[!] certipy returned no output")
+            return None
+        print(f"[+] certipy completed ({len(output)} chars)")
+        parsed = parse_certipy_output(output)
+        if not parsed:
+            print("[!] certipy parse returned empty — check certipy output format")
+            # Print first 500 chars for debugging
+            print("[*] certipy raw (first 500):", output[:500])
+        return parsed
+    except subprocess.TimeoutExpired:
+        print("[!] certipy timed out after 60s")
+        return None
+    except Exception as e:
+        print(f"[!] certipy error: {e}")
+        return None
+
+
+def parse_certipy_output(output):
+    """
+    Parse certipy -stdout output and extract CA-level findings.
+    Returns dict: { ca_name: { "raw": str, "permissions": {}, "vulns": [] } }
+    """
+    import re
+    result = {}
+    current_ca = None
+    section = None
+    right = None
+
+    lines = output.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Detect CA entry
+        m = re.match(r"\s*CA Name\s*:\s*(.+)", line)
+        if m:
+            current_ca = m.group(1).strip()
+            result[current_ca] = {
+                "raw": "",
+                "dns": "",
+                "permissions": {
+                    "Enroll": [],
+                    "ManageCA": [],
+                    "ManageCertificates": [],
+                },
+                "vulns": [],
+                "web_enrollment": False,
+                "user_specified_san": False,
+                "request_disposition": "",
+                "enforce_encryption": True,
+            }
+
+        if current_ca is None:
+            i += 1
+            continue
+
+        # Store raw output per CA (collect lines until next CA or end)
+        result[current_ca]["raw"] += line + "\n"
+
+        # Parse specific fields
+        if re.match(r"\s*DNS Name\s*:", line):
+            result[current_ca]["dns"] = stripped.split(":", 1)[1].strip()
+
+        elif re.match(r"\s*Web Enrollment\s*:", line):
+            result[current_ca]["web_enrollment"] = "enabled" in stripped.lower()
+
+        elif re.match(r"\s*User Specified SAN\s*:", line):
+            result[current_ca]["user_specified_san"] = "enabled" in stripped.lower()
+
+        elif re.match(r"\s*Request Disposition\s*:", line):
+            result[current_ca]["request_disposition"] = stripped.split(":", 1)[1].strip()
+
+        elif re.match(r"\s*Enforce Encryption for Requests\s*:", line):
+            result[current_ca]["enforce_encryption"] = "enabled" in stripped.lower()
+
+        # Parse permission sections
+        elif re.match(r"\s*Enroll\s*:", line):
+            right = "Enroll"
+            val = stripped.split(":", 1)[1].strip()
+            if val: result[current_ca]["permissions"]["Enroll"].append(val)
+
+        elif re.match(r"\s*ManageCa\s*:", line):
+            right = "ManageCA"
+            val = stripped.split(":", 1)[1].strip()
+            if val: result[current_ca]["permissions"]["ManageCA"].append(val)
+
+        elif re.match(r"\s*ManageCertificates\s*:", line):
+            right = "ManageCertificates"
+            val = stripped.split(":", 1)[1].strip()
+            if val: result[current_ca]["permissions"]["ManageCertificates"].append(val)
+
+        elif right and re.match(r"\s{30,}\S", line) and ":" not in stripped[:20]:
+            # Continuation of previous right (indented, no colon)
+            if right in result[current_ca]["permissions"]:
+                result[current_ca]["permissions"][right].append(stripped)
+
+        elif stripped.startswith("[!] Vulnerabilities") or stripped.startswith("ESC"):
+            right = None
+
+        # Parse vulnerabilities
+        m = re.match(r"\s*(ESC\d+)\s*:\s*(.+)", line)
+        if m:
+            result[current_ca]["vulns"].append({
+                "esc": m.group(1),
+                "detail": m.group(2).strip()
+            })
+
+        i += 1
+
+    # Clean up continuation lines — remove domain prefix for display
+    for ca in result.values():
+        for right_name in ["Enroll", "ManageCA", "ManageCertificates"]:
+            cleaned = []
+            for p in ca["permissions"][right_name]:
+                # Strip LAB.LOCAL\ prefix for cleaner display
+                if "\\" in p: p = p.split("\\", 1)[-1]
+                if p: cleaned.append(p)
+            ca["permissions"][right_name] = cleaned
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════
 # COLLECT ALL DATA
 # ══════════════════════════════════════════════════════════
 
@@ -678,18 +942,136 @@ def collect(conn, base):
         sd = gval(ca,"nTSecurityDescriptor")
         ca_acl = []
         if sd:
-            for ace in parse_sd(bytes(sd)):
-                name_r, tier = resolve(conn, base, ace["sid"])
-                ca_acl.append({"name":name_r,"tier":tier,
-                               "rights":rights_labels(ace),"deny":ace["deny"],
-                               "dangerous_write":ace.get("dangerous_write",False)})
-        esc7_vuln = any(e["dangerous_write"] and not e["deny"]
-                        and e["tier"] not in ("high","system") for e in ca_acl)
+            raw_aces = parse_sd(bytes(sd))
+
+            # The CA SD has two ACE types per principal:
+            # 1. Standard ACE (type 0x00) with CA custom bits:
+            #      0x2=ManageCA, 0x4=ManageCerts, 0x8=Enroll, 0x1=ReadCA
+            # 2. Object ACE (type 0x05) with DS_CTL_ACCESS(0x100) + GUID:
+            #      GUID a05b8cc2 = ManageCA
+            #      GUID 0e10c968 = ManageCertificates (on CA) OR Enroll
+            #
+            # Strategy: collect rights per SID from BOTH ACE types,
+            # deduplicate, and merge into one entry per SID.
+
+            # Group ACEs by (sid, deny)
+            sid_rights = {}  # (sid,deny) -> set of right labels
+            for ace in raw_aces:
+                key = (ace["sid"], ace["deny"])
+                if key not in sid_rights:
+                    sid_rights[key] = {"labels": set(), "mask": 0}
+                sid_rights[key]["mask"] |= ace["mask"]
+
+                m    = ace["mask"]
+                guid = ace.get("object_guid","")
+                scoped = ace.get("scoped", False)
+
+                # Standard ACE (type 0x00) — plain Windows DS object rights
+                if not scoped:
+                    for lbl in ca_std_mask_to_labels(m):
+                        sid_rights[key]["labels"].add(lbl)
+
+                # Object ACE (type 0x05) — GUID determines CA right
+                elif m & 0x100:  # DS_CTL_ACCESS
+                    if guid == MANAGE_CA_GUID:     # a05b8cc2 = ManageCA
+                        sid_rights[key]["labels"].add("ManageCA")
+                    else:                          # 0e10c968 or any other = Enroll
+                        sid_rights[key]["labels"].add("Enroll")
+
+            for (sid, deny), data in sid_rights.items():
+                name_r, tier = resolve(conn, base, sid)
+                rls = sorted(data["labels"]) if data["labels"] else [f"0x{data['mask']:08x}"]
+                is_dangerous = ca_is_dangerous(list(data["labels"]), tier) and not deny
+                danger_right = next((r for r in rls
+                                     if r in ("ManageCA","ManageCertificates")), "")
+                ca_acl.append({
+                    "sid": sid, "name": name_r, "tier": tier,
+                    "rights": rls, "deny": deny, "mask": data["mask"],
+                    "dangerous_write": is_dangerous,
+                    "write_reason": danger_right,
+                })
+        # ESC7: flag principals that have:
+        # 1. ManageCA or ManageCertificates (explicit CA management rights)
+        # 2. FullControl / WriteDACL / WriteOwner on the CA LDAP object
+        # All three allow ESC7-class attacks. Exclude expected HIGH/SYSTEM admins.
+        # NOTE: certipy also reads DCOM/RPC registry CA security (separate from LDAP SD)
+        #       so there may be principals visible in certipy that are NOT in the LDAP SD.
+        ESC7_RIGHTS = {"ManageCA","ManageCertificates","FullControl","WriteDACL","WriteOwner","GenericAll"}
+        esc7_principals = []
+        for e in ca_acl:
+            if e["deny"] or e["tier"] in ("high","system"):
+                continue
+            dangerous = ESC7_RIGHTS & set(e["rights"])
+            if dangerous:
+                esc7_principals.append(
+                    (e["name"],
+                     ", ".join(r for r in e["rights"] if r in ESC7_RIGHTS),
+                     e["tier"])
+                )
+        esc7_vuln = len(esc7_principals) > 0
+        # Fetch CA configuration attributes for ESC6/8/11 detection
+        ca_flags = {}
+        try:
+            conn.search(
+                f"CN={cn},CN=Enrollment Services,CN=Public Key Services,"
+                f"CN=Services,CN=Configuration,{base}",
+                "(objectClass=pKIEnrollmentService)",
+                attributes=["msPKI-Enrollment-Flag","flags",
+                            "certificateTemplates","dNSHostName"],
+                controls=SD_CONTROL
+            )
+            if conn.entries:
+                raw_ef = iflag(gval(conn.entries[0],"msPKI-Enrollment-Flag"))
+                raw_fl = iflag(gval(conn.entries[0],"flags"))
+                ca_flags = {"enrollment_flag": raw_ef, "ca_flags": raw_fl}
+        except Exception:
+            pass
+
+        # ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2
+        # Stored in CA registry: HKLM\SYSTEM\CCS\Services\CertSvc\Configuration\CA\PolicyModules\...\EditFlags
+        # Not readable via LDAP — requires certutil or DCOM/RPC (which certipy uses)
+        # We check the pKIEnrollmentService flags attribute as a best-effort
+        # If 0 it means we couldn't read it — mark as "manual check required"
+        esc6_flag = bool(ca_flags.get("ca_flags",0) & 0x00040000)
+        # Also check if pKI-Certificate-Authority-Name-Flags has the SAN bit
+        esc6_manual = not esc6_flag  # True = could not verify via LDAP, check manually
+
+        # ESC8: web enrollment — check if certfnsh.asp is reachable over HTTP
+        esc8_accessible = False
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"http://{dns}/certsrv/certfnsh.asp",
+                headers={"User-Agent":"ADCS-Watchdog"}
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                # 401 = exists and requires auth = vulnerable
+                pass
+            esc8_accessible = True
+        except Exception as ex:
+            err_str = str(ex)
+            # 401 Unauthorized = endpoint exists = vulnerable
+            if "401" in err_str or "Unauthorized" in err_str:
+                esc8_accessible = True
+
+        # ESC11: encryption not enforced for ICPR requests
+        # Flag bit 0x20 in msPKI-Enrollment-Flag on CA = encryption enforced
+        # If NOT set = ESC11
+        esc11_vuln = not bool(ca_flags.get("enrollment_flag",0) & 0x20)
+
         ca_info.append({
             "cn":cn,"dns":dns,"acl":ca_acl,
-            "esc6_flag":False,    # requires registry read — marked manual
+            "esc6_flag":esc6_flag,
+            "esc6_manual": esc6_manual,
             "esc7_vuln":esc7_vuln,
-            "esc8_accessible":False,  # requires HTTP check — marked manual
+            "esc7_principals":esc7_principals,
+            "esc7_rpc_note": ("NOTE: certipy detects ESC7 via DCOM/RPC registry CA security "
+                              "which is separate from the LDAP nTSecurityDescriptor. "
+                              "Run: certipy find -u USER -p PASS -dc-ip DC -vulnerable -stdout "
+                              "to check the RPC-based CA permissions."),
+            "esc8_accessible":esc8_accessible,
+            "esc11_vuln":esc11_vuln,
+            "ca_flags": ca_flags,
         })
 
     # ESC5: fetch PKI container ACLs
@@ -1254,14 +1636,197 @@ def build_html(ca_info, results, domain, dc_ip, diff_changes=None, prev_snap=Non
           </div>
         </div>"""
 
-    # ── CA info
-    ca_rows = ""
+    # ── CA cards — full ESC5/6/7/8/11 per CA ─────────────────────────────────
+    def sev_badge(sev):
+        return f'<span class="verdict-badge {sev_cls(sev)}">{sev.upper()}</span>'
+
+    ca_cards = ""
     for ca in ca_info:
-        ca_rows += f"""<tr>
-          <td>{h(ca['cn'])}</td>
-          <td>{h(ca['dns'])}</td>
-          <td><a class="ext-link" href="http://{h(ca['dns'])}/certsrv/certfnsh.asp" target="_blank">Check ESC8</a></td>
-        </tr>"""
+        cn  = h(ca["cn"]); dns = h(ca["dns"])
+
+        # ── CA-level ESC checks
+        esc6  = ca.get("esc6_flag",False)
+        esc7  = ca.get("esc7_vuln",False)
+        esc8  = ca.get("esc8_accessible",False)
+        esc11 = ca.get("esc11_vuln",False)
+
+        def ca_esc_row(esc_name, vuln, detail, note=""):
+            sev   = "high" if vuln else "pass"
+            badge = sev_badge(sev)
+            icon  = "⚠" if vuln else "✓"
+            cls   = "ca-esc-vuln" if vuln else "ca-esc-safe"
+            return (f'<tr class="{cls}"><td class="ca-esc-name">' +
+                    f'<span class="esc-label {sev_cls(sev)}">{esc_name}</span></td>' +
+                    f'<td>{badge}</td><td>{detail}</td>' +
+                    f'<td class="ca-esc-note">{note}</td></tr>')
+
+        esc_rows = ""
+        esc6_manual = ca.get("esc6_manual", True)
+        esc6_detail = ("User Specified SAN enabled — any enrolled cert can have arbitrary SAN"
+                       if esc6 else
+                       "Not detected via LDAP — requires registry/RPC check (certutil)")
+        esc6_note   = "certutil -config " + h(f'"{dns}\\{cn}"') + " -getreg policy\\EditFlags"
+        esc6_manual_badge = (' <span class="manual-badge">manual check required</span>'
+                             if esc6_manual else "")
+
+        esc7_rpc_note = ca.get("esc7_rpc_note","")
+        esc7_detail = ("Low-priv has ManageCA / ManageCertificates / FullControl on CA"
+                       if esc7 else
+                       "Not detected in LDAP CA SD — certipy may detect via RPC/registry")
+        esc7_note   = ("Check RPC-based CA security (certipy reads DCOM/RPC, not LDAP SD): "
+                       "certipy ca -u USER@DOMAIN -p PASS -dc-ip DC_IP"
+                       f" -ca '{h(cn)}' -list-templates")
+
+        esc_rows += ca_esc_row("ESC6",  esc6,
+            esc6_detail + esc6_manual_badge, esc6_note)
+        esc_rows += ca_esc_row("ESC7",  esc7,
+            esc7_detail, esc7_note)
+        esc_rows += ca_esc_row("ESC8",  esc8,
+            "Web enrollment accessible over HTTP — NTLM relay attack possible",
+            f"curl -v http://{dns}/certsrv/certfnsh.asp")
+        esc_rows += ca_esc_row("ESC11", esc11,
+            "Encryption not enforced for ICPR requests",
+            "Relay attack without needing NTLM auth (similar to ESC8)")
+
+        # ── CA ACL table
+        acl_rows = ""
+        for e in sorted(ca.get("acl",[]), key=lambda x: x["tier"]):
+            tc     = tier_cls(e["tier"])
+            act    = "DENY" if e["deny"] else "ALLOW"
+            act_c  = "deny" if e["deny"] else "allow"
+            rights = ", ".join(e["rights"]) if e["rights"] else "—"
+            warn   = "⚠ " if e.get("dangerous_write") and not e["deny"] else ""
+            acl_rows += (
+                f'<tr><td><span class="tier-badge {tc}">{h(e["tier"].upper())}</span></td>' +
+                f'<td class="principal-cell">{h(e["name"])}</td>' +
+                f'<td class="sid-cell">{h(e.get("sid",""))}</td>' +
+                f'<td><span class="action-badge {act_c}">{act}</span></td>' +
+                f'<td>{warn}{h(rights)}</td></tr>'
+            )
+
+        # ── ESC7 principals detail
+        esc7_detail = ""
+        for pname, rights, tier in ca.get("esc7_principals",[]):
+            tc = tier_cls(tier)
+            esc7_detail += (
+                f'<div class="esc7-princ">' +
+                f'<span class="tier-badge {tc} small">{h(tier.upper())}</span> ' +
+                f'<strong>{h(pname)}</strong> ' +
+                f'<span class="esc7-rights">→ {h(rights)}</span></div>'
+            )
+
+        vuln_count = sum([esc6,esc7,esc8,esc11])
+        ca_sev = "high" if vuln_count > 0 else "pass"
+        ca_dot = f'<span class="sev-dot {sev_cls(ca_sev)}"></span>'
+
+        # ── certipy section
+        cd = ca.get("certipy", {})
+        if cd:
+            # Build permission rows from certipy RPC data
+            def certipy_perm_rows(right_name, principals, is_dangerous=False):
+                rows = ""
+                for p in principals:
+                    tier = "low" if p not in ("Domain Admins","Enterprise Admins","Administrators") else "high"
+                    tc   = tier_cls(tier)
+                    warn = "⚠ " if is_dangerous and tier not in ("high","system") else ""
+                    rows += (f'<tr><td><span class="tier-badge {tc}">{tier.upper()}</span></td>' +
+                             f'<td>{h(p)}</td><td>{warn}{h(right_name)}</td></tr>')
+                return rows
+
+            # Only show CA management rights — Enroll is already in the LDAP ACL table above
+            certipy_rows = ""
+            certipy_rows += certipy_perm_rows("ManageCA",           cd["permissions"].get("ManageCA",[]),           True)
+            certipy_rows += certipy_perm_rows("ManageCertificates", cd["permissions"].get("ManageCertificates",[]), True)
+            # Show Enroll separately only for principals NOT already in LDAP ACL
+            ldap_sids = {e["name"] for e in ca.get("acl",[])}
+            enroll_only = [p for p in cd["permissions"].get("Enroll",[])
+                           if p not in ldap_sids and p not in
+                           cd["permissions"].get("ManageCA",[]) and p not in
+                           cd["permissions"].get("ManageCertificates",[])]
+            if enroll_only:
+                certipy_rows += certipy_perm_rows("Enroll", enroll_only, False)
+
+            certipy_vulns_html = ""
+            for v in cd.get("vulns",[]):
+                sev = "high" if v["esc"] in ("ESC6","ESC7","ESC8","ESC11") else "medium"
+                certipy_vulns_html += (
+                    f'<div class="certipy-vuln">' +
+                    f'<span class="esc-label {sev_cls(sev)}">{h(v["esc"])}</span> ' +
+                    f'<span class="certipy-vuln-detail">{h(v["detail"])}</span></div>'
+                )
+
+            # Build flags row
+            flags_html = ""
+            if cd.get("web_enrollment"):     flags_html += '<span class="ca-flag flag-danger">Web Enrollment: ENABLED</span>'
+            if cd.get("user_specified_san"): flags_html += '<span class="ca-flag flag-danger">User Specified SAN: ENABLED</span>'
+            if not cd.get("enforce_encryption", True): flags_html += '<span class="ca-flag flag-danger">Encryption Not Enforced</span>'
+            if cd.get("request_disposition"):flags_html += f'<span class="ca-flag flag-info">Disposition: {h(cd["request_disposition"])}</span>'
+
+            certipy_section = f"""
+            <div class="section-title">
+              🔍 certipy — CA Permissions via DCOM/RPC (Registry Security)
+              <span class="certipy-source-note">Source: ICertAdminD2 — reads CA registry, not LDAP SD</span>
+            </div>
+            <div class="certipy-flags">{flags_html}</div>
+            <div class="certipy-vulns">{certipy_vulns_html or '<span style="color:var(--text2);font-size:12px">No vulnerabilities detected by certipy</span>'}</div>
+            <div class="table-wrap" style="margin-top:10px">
+              <table class="ca-esc-table">
+                <thead><tr><th>Tier</th><th>Principal</th><th>Right (from registry)</th></tr></thead>
+                <tbody>{certipy_rows or '<tr><td colspan="3" style="color:var(--text2);padding:10px">No permissions returned by certipy</td></tr>'}</tbody>
+              </table>
+            </div>
+            <details class="certipy-raw-wrap">
+              <summary>Raw certipy output</summary>
+              <pre class="raw-output">{h(cd.get("raw",""))}</pre>
+            </details>"""
+        else:
+            certipy_section = """
+            <div class="certipy-not-run">
+              <span class="certipy-icon">ℹ</span>
+              certipy not available or skipped — CA registry permissions not checked.<br>
+              Install: <code>pip install certipy-ad --break-system-packages</code><br>
+              Or use: <code>certipy find -u USER@DOMAIN -p PASS -dc-ip DC -vulnerable -stdout</code>
+            </div>"""
+
+        ca_cards += f"""
+        <div class="ca-card sev-border-{ca_sev}">
+          <div class="ca-card-header" onclick="toggleCaCard(this)">
+            <div class="card-title">
+              {ca_dot}
+              <span class="ca-card-name">🏛 {cn}</span>
+              <span class="ca-hostname">{dns}</span>
+              {'<span class="vuln-count sev-high">'+str(vuln_count)+' CA finding'+ ('s' if vuln_count!=1 else '')+'</span>' if vuln_count else '<span class="vuln-count sev-pass">Clean</span>'}
+            </div>
+            <div class="card-meta">
+              <span class="chevron">›</span>
+            </div>
+          </div>
+          <div class="ca-card-body" style="display:none">
+
+            <div class="section-title">CA-Level ESC Vulnerabilities (ESC5/6/7/8/11)</div>
+            <div class="table-wrap">
+              <table class="ca-esc-table">
+                <thead><tr><th>ESC</th><th>Verdict</th><th>Detail</th><th>How to verify / fix</th></tr></thead>
+                <tbody>{esc_rows}</tbody>
+              </table>
+            </div>
+
+            {'<div class="section-title">ESC7 — Principals with ManageCA / ManageCertificates</div><div class="esc7-principals">'+esc7_detail+'</div>' if esc7_detail else ''}
+
+            <div class="section-title">CA ACL — All Permissions (LDAP nTSecurityDescriptor)</div>
+            <div class="table-wrap">
+              <table class="acl-table">
+                <thead><tr><th>Tier</th><th>Principal</th><th>SID</th><th>Action</th><th>Rights</th></tr></thead>
+                <tbody>{acl_rows or '<tr><td colspan="5" style="color:var(--text2);padding:12px">No ACEs parsed</td></tr>'}</tbody>
+              </table>
+            </div>
+
+            {certipy_section}
+
+          </div>
+        </div>"""
+
+    ca_rows = ca_cards  # keep variable name for template compatibility
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1491,6 +2056,45 @@ tr:last-child td {{ border-bottom:none }}
 .ca-section h2 {{ padding:12px 18px; font-size:12px; font-weight:700;
                   text-transform:uppercase; letter-spacing:.8px;
                   background:var(--bg3); border-bottom:1px solid var(--border) }}
+.ca-cards-container {{ padding:12px; display:flex; flex-direction:column; gap:10px }}
+.ca-card {{ background:var(--bg3); border:1px solid var(--border);
+            border-radius:8px; overflow:hidden }}
+.ca-card-header {{ display:flex; justify-content:space-between; align-items:center;
+                   padding:12px 16px; cursor:pointer; user-select:none }}
+.ca-card-header:hover {{ background:rgba(255,255,255,.03) }}
+.ca-card-name {{ font-weight:700; font-size:14px }}
+.ca-hostname {{ color:var(--text2); font-size:12px; margin-left:8px }}
+.ca-card-body {{ padding:0 16px 16px }}
+.ca-esc-table {{ width:100%; border-collapse:collapse }}
+.ca-esc-table th {{ background:var(--bg); color:var(--text2); font-size:10px;
+                    font-weight:700; text-transform:uppercase; padding:7px 10px;
+                    border-bottom:1px solid var(--border); text-align:left }}
+.ca-esc-table td {{ padding:8px 10px; font-size:12px;
+                    border-bottom:1px solid rgba(48,54,61,.4) }}
+.ca-esc-vuln {{ background:rgba(248,81,73,.04) }}
+.ca-esc-safe {{ opacity:.6 }}
+.ca-esc-name {{ width:60px }}
+.ca-esc-note {{ color:var(--text2); font-size:11px; font-family:var(--font) }}
+.esc7-principals {{ padding:10px 2px; display:flex; flex-wrap:wrap; gap:8px }}
+.esc7-princ {{ background:var(--bg); border:1px solid var(--border);
+               border-radius:6px; padding:7px 12px; font-size:12px;
+               display:flex; align-items:center; gap:7px }}
+.esc7-rights {{ color:var(--red); font-size:11px }}
+.manual-badge {{ background:rgba(88,166,255,.12); color:var(--blue); font-size:9px; padding:1px 6px; border-radius:4px; font-weight:700; letter-spacing:.4px; margin-left:6px }}
+.certipy-source-note {{ font-size:10px; color:var(--text2); font-weight:400; margin-left:10px }}
+.certipy-flags {{ display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 }}
+.ca-flag {{ font-size:11px; padding:3px 10px; border-radius:4px; font-weight:700 }}
+.flag-danger {{ background:rgba(248,81,73,.12); color:var(--red) }}
+.flag-info   {{ background:rgba(88,166,255,.10); color:var(--blue) }}
+.certipy-vulns {{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px }}
+.certipy-vuln {{ display:flex; align-items:center; gap:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:5px 12px }}
+.certipy-vuln-detail {{ font-size:11px; color:var(--text2) }}
+.certipy-raw-wrap {{ margin-top:10px }}
+.certipy-raw-wrap summary {{ cursor:pointer; font-size:11px; color:var(--text2); padding:6px 0; user-select:none }}
+.certipy-raw-wrap summary:hover {{ color:var(--text) }}
+.certipy-not-run {{ background:rgba(88,166,255,.05); border:1px solid rgba(88,166,255,.2); border-radius:6px; padding:14px 16px; font-size:12px; color:var(--text2); margin-top:14px; line-height:1.8 }}
+.certipy-not-run code {{ background:var(--bg3); color:var(--cyan); padding:1px 5px; border-radius:3px; font-size:11px }}
+.certipy-icon {{ font-size:16px; margin-right:6px }}
 .ext-link {{ color:var(--blue); font-size:11px }}
 
 /* ── Legend */
@@ -1627,12 +2231,9 @@ tr:last-child td {{ border-bottom:none }}
 
   <!-- CAs -->
   <div class="ca-section">
-    <h2>Enterprise Certificate Authorities</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>CA Name</th><th>Hostname</th><th>ESC Checks</th></tr></thead>
-        <tbody>{ca_rows}</tbody>
-      </table>
+    <h2>🏛 Enterprise Certificate Authorities — CA-Level Findings</h2>
+    <div class="ca-cards-container">
+      {ca_rows}
     </div>
   </div>
 
@@ -1659,6 +2260,10 @@ tr:last-child td {{ border-bottom:none }}
       <button class="filter-btn esc-btn" data-filter="esc2" onclick="toggleEsc('esc2',this)">ESC2</button>
       <button class="filter-btn esc-btn" data-filter="esc3" onclick="toggleEsc('esc3',this)">ESC3</button>
       <button class="filter-btn esc-btn" data-filter="esc4" onclick="toggleEsc('esc4',this)">ESC4</button>
+      <button class="filter-btn esc-btn" data-filter="esc5" onclick="toggleEsc('esc5',this)">ESC5</button>
+      <button class="filter-btn esc-btn" data-filter="esc6" onclick="toggleEsc('esc6',this)">ESC6</button>
+      <button class="filter-btn esc-btn" data-filter="esc7" onclick="toggleEsc('esc7',this)">ESC7</button>
+      <button class="filter-btn esc-btn" data-filter="esc8" onclick="toggleEsc('esc8',this)">ESC8</button>
       <button class="filter-btn esc-btn" data-filter="esc9" onclick="toggleEsc('esc9',this)">ESC9</button>
     </div>
 
@@ -1883,6 +2488,14 @@ tr:last-child td {{ border-bottom:none }}
 </div><!-- end page-changes -->
 
 <script>
+function toggleCaCard(hdr) {{
+  var body = hdr.nextElementSibling;
+  var chev = hdr.querySelector('.chevron');
+  var open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : 'block';
+  if (chev) chev.classList.toggle('open', !open);
+}}
+
 function switchRawTab(btn, panelId) {{
   var section = btn.closest('.raw-tools-section');
   section.querySelectorAll('.raw-tab').forEach(b => b.classList.remove('active'));
@@ -1990,18 +2603,10 @@ function applyFilters() {{
       ' <span style="color:var(--blue)">(filtered)</span>' : '');
 }}
 
-// Auto-expand vulnerable cards on load
+// All cards collapsed by default — click to expand
 document.addEventListener('DOMContentLoaded', function() {{
-  document.querySelectorAll('.template-card').forEach(function(c) {{
-    if (c.dataset.sev !== 'pass') {{
-      var body = c.querySelector('.card-body');
-      var chev = c.querySelector('.chevron');
-      body.style.display = 'block';
-      chev.classList.add('open');
-    }}
-  }});
-  // start with "All" active
-  document.querySelector('.sev-btn[data-filter="all"]').classList.add('active');
+  var allBtn = document.querySelector('.sev-btn[data-filter="all"]');
+  if (allBtn) allBtn.classList.add('active');
 }});
 </script>
 </body>
@@ -2558,6 +3163,85 @@ def build_json_export(ca_info, results, domain, dc_ip, diff_changes=None):
     return json.dumps(export, indent=2)
 
 # ══════════════════════════════════════════════════════════
+# TERMINAL REPORT
+
+def print_terminal_report(ca_info, results, domain, dc_ip, diff_changes=None):
+    R="\033[91m"; O="\033[93m"; G="\033[92m"; C="\033[96m"
+    W="\033[97m"; DIM="\033[2m"; BOLD="\033[1m"; RST="\033[0m"
+    SEP="="*70; DASH="-"*66
+    SEV_COL={"critical":R,"high":O,"medium":C,"pass":G}
+    print()
+    print(BOLD+SEP+RST)
+    print(BOLD+"  ADCS AUDIT — "+domain+" ("+dc_ip+")"+RST)
+    print(BOLD+SEP+RST)
+    print("\n"+BOLD+C+"  CERTIFICATE AUTHORITIES"+RST)
+    print("  "+DASH)
+    for ca in ca_info:
+        esc6=ca.get("esc6_flag",False); esc7=ca.get("esc7_vuln",False)
+        esc8=ca.get("esc8_accessible",False); esc11=ca.get("esc11_vuln",False)
+        ca_vulns=[e for e,v in [("ESC6",esc6),("ESC7",esc7),("ESC8",esc8),("ESC11",esc11)] if v]
+        status=R+"VULNERABLE ("+", ".join(ca_vulns)+")"+RST if ca_vulns else G+"CLEAN"+RST
+        print()
+        print("  "+BOLD+W+ca["cn"]+RST+"  "+DIM+ca["dns"]+RST)
+        print("  Status : "+status)
+        if esc7:
+            print("  "+O+"ESC7 Principals:"+RST)
+            for pname,rights,tier in ca.get("esc7_principals",[]):
+                print("    "+O+"⚠  "+pname+"  →  "+rights+RST)
+        cd=ca.get("certipy",{})
+        if cd and cd.get("permissions"):
+            mc =[p for p in cd["permissions"].get("ManageCA",[])
+                 if p not in ("Domain Admins","Enterprise Admins","Administrators")]
+            mce=[p for p in cd["permissions"].get("ManageCertificates",[])
+                 if p not in ("Domain Admins","Enterprise Admins","Administrators")]
+            if mc or mce:
+                print("  "+O+"Registry CA Security (certipy/RPC):"+RST)
+                for p in mc:  print("    "+R+"⚠  "+p+"  →  ManageCA"+RST)
+                for p in mce: print("    "+R+"⚠  "+p+"  →  ManageCertificates"+RST)
+    vuln_results=[r for r in results if r["max_sev"]!="pass"]
+    clean_count =len(results)-len(vuln_results)
+    crit=sum(1 for r in results if r["max_sev"]=="critical")
+    high=sum(1 for r in results if r["max_sev"]=="high")
+    med =sum(1 for r in results if r["max_sev"]=="medium")
+    print("\n"+BOLD+C+"  CERTIFICATE TEMPLATES"+RST)
+    print("  "+DASH)
+    print("  Total: "+str(len(results))+
+          "  |  "+R+"Critical: "+str(crit)+RST+
+          "  |  "+O+"High: "+str(high)+RST+
+          "  |  "+C+"Medium: "+str(med)+RST+
+          "  |  "+G+"Clean: "+str(clean_count)+RST)
+    print()
+    sev_order={"critical":0,"high":1,"medium":2}
+    for r in sorted(vuln_results,key=lambda x:sev_order.get(x["max_sev"],3)):
+        col=SEV_COL.get(r["max_sev"],W)
+        pub="  ["+(", ".join(r["cas"]))+"]" if r["cas"] else "  [not published]"
+        print("  "+col+BOLD+"["+r["max_sev"].upper()+"]"+RST+
+              "  "+BOLD+r["name"]+RST+DIM+pub+RST)
+        for chk in r["checks"]:
+            if not chk["vuln"]: continue
+            print("    "+col+"✗ "+chk["esc"]+RST+
+                  ("  "+DIM+chk.get("notes","")+RST if chk.get("notes") else ""))
+            for p in chk.get("principals",[])[:3]:
+                rstr=", ".join(p[1]) if isinstance(p[1],list) else str(p[1])
+                print("      "+col+"→"+RST+" "+p[0]+"  ["+p[2]+"]  "+rstr)
+        print()
+    if diff_changes:
+        nv=[c for c in diff_changes if c["type"]=="new_vuln"]
+        fx=[c for c in diff_changes if c["type"]=="fixed_vuln"]
+        wo=[c for c in diff_changes if c.get("direction")=="WORSENED"]
+        bt=[c for c in diff_changes if c.get("direction")=="IMPROVED"]
+        if any([nv,fx,wo,bt]):
+            print(BOLD+C+"  CHANGES VS PREVIOUS SCAN"+RST)
+            print("  "+DASH)
+            for c in nv: print("  "+R+"NEW    "+RST+c.get("template","")+": "+c.get("detail",""))
+            for c in wo: print("  "+O+"WORSE  "+RST+c.get("template","")+": "+c.get("detail",""))
+            for c in fx: print("  "+G+"FIXED  "+RST+c.get("template","")+": "+c.get("detail",""))
+            for c in bt: print("  "+G+"BETTER "+RST+c.get("template","")+": "+c.get("detail",""))
+            print()
+    print(BOLD+SEP+RST)
+    print("  Tip: run without --terminal to get the full web dashboard")
+    print(BOLD+SEP+RST+"\n")
+
 # HTTP SERVER
 # ══════════════════════════════════════════════════════════
 
@@ -2621,15 +3305,29 @@ def main():
     global _HTML_CONTENT
 
     ap = argparse.ArgumentParser(description="ADCS Web Audit — serves on http://0.0.0.0:4000")
-    ap.add_argument("-u","--user",     required=True)
-    ap.add_argument("-p","--password", required=True)
+    ap.add_argument("-u","--user",     required=False, default=None)
+    ap.add_argument("-p","--password", required=False, default=None)
     ap.add_argument("-d","--dc-ip",    required=True)
     ap.add_argument("--domain",        help="FQDN — auto-detected from -u if omitted")
     ap.add_argument("--no-ntlm",       action="store_true")
     ap.add_argument("--port",          type=int, default=4000)
     ap.add_argument("--output",        metavar="FILE",
                     help="Also save HTML to file (e.g. report.html)")
+    ap.add_argument("--reset-history", action="store_true",
+                    help="Clear scan history before running — fresh baseline")
+    ap.add_argument("--no-certipy",    action="store_true",
+                    help="Skip certipy CA checks (use only LDAP-based detection)")
+    ap.add_argument("--browser",       action="store_true",
+                    help="Auto-open the dashboard in the default browser after startup")
+    ap.add_argument("-k","--kerberos", action="store_true",
+                    help="Kerberos auth — requires KRB5CCNAME env var")
+    ap.add_argument("--hashes",        metavar="LM:NT",
+                    help="Pass-the-hash: LMHASH:NTHASH or :NTHASH")
+    ap.add_argument("--terminal",      action="store_true",
+                    help="Print to terminal only, skip web server")
     args = ap.parse_args()
+    if not args.kerberos and not args.user:
+        ap.error("-u/--user required unless --kerberos is used")
 
     domain = args.domain
     if not domain:
@@ -2647,13 +3345,32 @@ def main():
     try:
         srv  = Server(args.dc_ip, port=389, use_ssl=False,
                       get_info=ALL, connect_timeout=30)
-        if not args.no_ntlm:
-            u    = f"{domain}\\{args.user.split('@')[0]}"
-            conn = Connection(srv, user=u, password=args.password,
+        if args.kerberos:
+            import os as _os
+            ccache = _os.environ.get("KRB5CCNAME","")
+            if not ccache:
+                print("[!] KRB5CCNAME not set — export KRB5CCNAME=/path/to/ticket.ccache")
+                sys.exit(1)
+            print(f"[*] Kerberos auth (ccache: {ccache})")
+            conn = Connection(srv, authentication=SASL, sasl_mechanism=KERBEROS,
+                              auto_bind=True, receive_timeout=60)
+        elif args.hashes:
+            parts = args.hashes.split(":")
+            lm = parts[0] if len(parts)==2 and parts[0] else "aad3b435b51404eeaad3b435b51404ee"
+            nt = parts[-1]
+            uname = args.user.split("@")[0] if args.user else ""
+            u  = domain + "\\" + uname
+            print(f"[*] Pass-the-hash for {u}")
+            conn = Connection(srv, user=u, password=f"{lm}:{nt}",
                               authentication=NTLM, auto_bind=True, receive_timeout=60)
-        else:
+        elif args.no_ntlm:
             conn = Connection(srv, user=args.user, password=args.password,
                               authentication=SIMPLE, auto_bind=True, receive_timeout=60)
+        else:
+            uname = args.user.split("@")[0] if args.user else args.user
+            u    = domain + "\\" + uname
+            conn = Connection(srv, user=u, password=args.password,
+                              authentication=NTLM, auto_bind=True, receive_timeout=60)
         print("[+] Authenticated")
     except LDAPBindError as e:
         print(f"[!] Auth failed: {e}"); sys.exit(1)
@@ -2666,6 +3383,62 @@ def main():
     ca_info, results = collect(conn, base)
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     print(f"[+] {len(ca_info)} CAs, {len(results)} templates, {len(_SC)} SIDs resolved")
+
+    # Run certipy for CA-level RPC/registry checks (ESC6/7/8/11 real permissions)
+    certipy_data = {}
+    if not args.no_certipy:
+        certipy_data = run_certipy(args.user, args.password, args.dc_ip, domain) or {}
+        if certipy_data:
+            print(f"[+] certipy parsed {len(certipy_data)} CA(s): {list(certipy_data.keys())}")
+        else:
+            print("[!] certipy returned no parseable CA data")
+        # Merge certipy findings into ca_info — fuzzy CA name match
+        for ca in ca_info:
+            cn = ca["cn"]
+            # Try exact match first, then case-insensitive, then partial
+            cd = certipy_data.get(cn)
+            if cd is None:
+                cn_lower = cn.lower()
+                for k,v in certipy_data.items():
+                    if k.lower() == cn_lower or cn_lower in k.lower() or k.lower() in cn_lower:
+                        cd = v
+                        print(f"[*] certipy CA match: '{cn}' -> '{k}'")
+                        break
+            if cd is None:
+                cd = {}
+            ca["certipy"] = cd
+            # Override ESC flags with certipy findings if available
+            if cd:
+                ca["certipy_vulns"] = [v["esc"] for v in cd.get("vulns", [])]
+                if "ESC6" in ca["certipy_vulns"]:
+                    ca["esc6_flag"] = True
+                    ca["esc6_manual"] = False
+                if "ESC7" in ca["certipy_vulns"]:
+                    ca["esc7_vuln"] = True
+                    # Merge certipy ManageCA/ManageCerts into esc7_principals
+                    existing_names = {p[0] for p in ca.get("esc7_principals",[])}
+                    for pname in cd["permissions"].get("ManageCA",[]):
+                        if pname not in existing_names and pname not in (
+                                "Domain Admins","Enterprise Admins","Administrators"):
+                            ca.setdefault("esc7_principals",[]).append(
+                                (pname, "ManageCA (via certipy/RPC)", "unknown"))
+                    for pname in cd["permissions"].get("ManageCertificates",[]):
+                        if pname not in existing_names and pname not in (
+                                "Domain Admins","Enterprise Admins","Administrators"):
+                            ca.setdefault("esc7_principals",[]).append(
+                                (pname, "ManageCertificates (via certipy/RPC)", "unknown"))
+                if "ESC8" in ca["certipy_vulns"]:
+                    ca["esc8_accessible"] = True
+                if "ESC11" in ca["certipy_vulns"]:
+                    ca["esc11_vuln"] = True
+            else:
+                ca["certipy"] = {}
+                ca["certipy_vulns"] = []
+    else:
+        for ca in ca_info:
+            ca["certipy"] = {}
+            ca["certipy_vulns"] = []
+        print("[*] certipy skipped (--no-certipy)")
 
     # Build snapshot and diff
     curr_snap = results_to_snapshot(ca_info, results, domain, args.dc_ip)
@@ -2690,6 +3463,10 @@ def main():
         "ts": ts, "diff_changes": diff_changes,
         "prev_snap": prev_snap, "curr_snap": curr_snap,
     })
+
+    if args.terminal:
+        print_terminal_report(ca_info, results, domain, args.dc_ip, diff_changes)
+        sys.exit(0)
 
     print("[*] Building HTML report ...")
     _HTML_CONTENT = build_html(ca_info, results, domain, args.dc_ip,

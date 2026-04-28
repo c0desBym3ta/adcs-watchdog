@@ -1,5 +1,8 @@
-# ADCS Watchdog — Python dependencies
-# Install with: pip install -r requirements.txt
+# ADCS Watchdog v1.1 — Python dependencies
+# Install: pip install -r requirements.txt
 
-ldap3>=2.9.1        # LDAP connection, NTLM auth, SD control
+ldap3>=2.9.1        # LDAP connection, NTLM/SASL auth, SD control
 openpyxl>=3.1.0     # Excel export (.xlsx)
+
+# Optional but strongly recommended — needed for CA-level ESC6/7/8/11 detection
+# pip install certipy-ad --break-system-packages
